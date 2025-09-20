@@ -3,30 +3,24 @@ import pandas as pd
 import numpy as np
 import re
 import os
-import joblib
 import warnings
-warnings.filterwarnings('ignore')
-
+from geopy.distance import geodesic
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import seaborn as sns
 import matplotlib.pyplot as plt
-
-# Advanced ML imports
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
+import google.generativeai as genai
 
-# Geospatial
-from geopy.distance import geodesic
+warnings.filterwarnings('ignore')
 
-# --- Configuration ---
-# It's better practice to store artifacts separately if needed
-# PROCESSED_DATA_PATH = "fetii_advanced_processed_data.parquet"
-# MODEL_ARTIFACTS_PATH = "fetii_advanced_model_artifacts.joblib"
+# --- Global Configuration ---
+DATA_FILE_PATH = "FetiiAI_Data_Austin.xlsx"
+GEMINI_MODEL_NAME = "gemini-1.5-flash" # Use the correct model name here
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -121,6 +115,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Use st.cache_resource to load heavy data and models once
+@st.cache_resource
+def load_data_and_train_models(file_path):
+    """Loads and preprocesses data from a multi-sheet Excel file."""
+    ai_assistant = AdvancedFetiiAI()
+    success = ai_assistant.load_data_from_file(file_path)
+    return ai_assistant, success
 
 class AdvancedFetiiAI:
     def __init__(self):
@@ -130,46 +131,79 @@ class AdvancedFetiiAI:
         self.label_encoders = {}
         self.metrics = {}
         self.feature_importances = None
-
-    def load_data(self, uploaded_file):
+        self.data_sheets = {}
+        self.gemini_model = None
+        self.api_available = False
+        
+        # Configure Gemini API
         try:
-            if uploaded_file.name.endswith('.csv'):
-                self.trip_data = pd.read_csv(uploaded_file)
-            elif uploaded_file.name.endswith(('.xls', '.xlsx')):
-                self.trip_data = pd.read_excel(uploaded_file)
-            else:
-                st.error("Unsupported file format. Please upload a CSV or Excel file.")
-                return False
+            genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+            self.gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+            self.api_available = True
+        except Exception as e:
+            st.error(f"Gemini API could not be configured with model '{GEMINI_MODEL_NAME}'. Please check your `.streamlit/secrets.toml` file and the model name. Error: {e}")
+            self.api_available = False
 
-            self.trip_data.columns = [re.sub(r'[^a-zA-Z0-9]+', '_', col).lower().strip('_') for col in self.trip_data.columns]
+    def get_feature_importances(self):
+        """Returns the feature importances dataframe."""
+        return self.feature_importances
+
+    def load_data_from_file(self, file_path):
+        """Loads data from a multi-sheet Excel file."""
+        try:
+            if not os.path.exists(file_path):
+                st.error(f"Data file not found at: {file_path}")
+                return False
+            
+            xls = pd.ExcelFile(file_path)
+            self.data_sheets = {sheet_name: xls.parse(sheet_name) for sheet_name in xls.sheet_names}
             
             self._process_comprehensive_data()
             self._train_advanced_models()
             
             self.data_loaded = True
             return True
-            
         except Exception as e:
             st.error(f"Error loading or processing data: {e}")
             return False
 
     def _process_comprehensive_data(self):
-        df = self.trip_data.copy()
+        """Merges and processes data from all sheets."""
+        trip_data = self.data_sheets.get('Trip Data')
+        checked_in_users = self.data_sheets.get('Checked in User ID')
+        customer_demographics = self.data_sheets.get('Customer Demographics')
         
-        # Datetime processing
+        if trip_data is None:
+            st.error("Missing 'Trip Data' sheet.")
+            return
+
+        trip_data.columns = [re.sub(r'[^a-zA-Z0-9]+', '_', col).lower().strip('_') for col in trip_data.columns]
+        if checked_in_users is not None:
+            checked_in_users.columns = [re.sub(r'[^a-zA-Z0-9]+', '_', col).lower().strip('_') for col in checked_in_users.columns]
+        if customer_demographics is not None:
+            customer_demographics.columns = [re.sub(r'[^a-zA-Z0-9]+', '_', col).lower().strip('_') for col in customer_demographics.columns]
+            
+        df = trip_data.copy()
+        if checked_in_users is not None and customer_demographics is not None:
+            user_demographics_df = pd.merge(checked_in_users, customer_demographics, on='user_id', how='left')
+            aggregated_demographics = user_demographics_df.groupby('trip_id').agg(
+                age=('age', 'mean'),
+                gender=('gender', lambda x: x.mode()[0] if not x.mode().empty else 'Unknown')
+            ).reset_index()
+            df = pd.merge(df, aggregated_demographics, on='trip_id', how='left')
+
         datetime_cols = [col for col in df.columns if 'date' in col or 'time' in col]
         if datetime_cols:
             main_dt_col = datetime_cols[0]
             df[main_dt_col] = pd.to_datetime(df[main_dt_col], errors='coerce')
-            df.dropna(subset=[main_dt_col], inplace=True) # Drop rows where date conversion failed
+            df.dropna(subset=[main_dt_col], inplace=True)
             
             df['hour'] = df[main_dt_col].dt.hour
             df['day_of_week'] = df[main_dt_col].dt.dayofweek
             df['month'] = df[main_dt_col].dt.month
             df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
             df['is_rush_hour'] = (((df['hour'] >= 7) & (df['hour'] <= 9)) | ((df['hour'] >= 17) & (df['hour'] <= 19))).astype(int)
-        
-        # Geospatial features
+            
         lat_cols = [col for col in df.columns if 'lat' in col]
         lon_cols = [col for col in df.columns if 'lon' in col]
         
@@ -180,7 +214,7 @@ class AdvancedFetiiAI:
                 else np.nan,
                 axis=1
             )
-        
+            
         self.enhanced_data = df.copy()
         self._calculate_advanced_metrics()
 
@@ -190,40 +224,35 @@ class AdvancedFetiiAI:
 
         self.metrics = {
             'total_trips': len(df),
-            'total_passengers': df[passenger_col].sum() if passenger_col else 'N/A',
+            'total_passengers': df[passenger_col].sum() if passenger_col and pd.api.types.is_numeric_dtype(df[passenger_col]) else 'N/A',
             'avg_trip_distance': df['trip_distance_km'].mean() if 'trip_distance_km' in df.columns else 'N/A',
-            'avg_passengers_per_trip': df[passenger_col].mean() if passenger_col else 'N/A',
+            'avg_passengers_per_trip': df[passenger_col].mean() if passenger_col and pd.api.types.is_numeric_dtype(df[passenger_col]) else 'N/A',
             'peak_hour': df['hour'].mode().iloc[0] if 'hour' in df.columns else 'N/A',
             'weekend_trip_percentage': (df['is_weekend'].sum() / len(df) * 100) if 'is_weekend' in df.columns else 'N/A',
         }
-        
+    
     def _train_advanced_models(self):
         df = self.enhanced_data.copy()
         passenger_col = next((col for col in df.columns if 'passenger' in col), None)
-        if not passenger_col:
-            st.warning("No 'passenger' column found. Predictive models for passenger count cannot be trained.")
-            return
+        if not passenger_col: return
 
         df[passenger_col] = pd.to_numeric(df[passenger_col], errors='coerce').fillna(df[passenger_col].median())
 
         numerical_features = df.select_dtypes(include=np.number).columns.tolist()
         categorical_features = df.select_dtypes(include=['object', 'category']).columns.tolist()
         
-        # Remove IDs, target variable, and high-cardinality features
         features_to_exclude = [passenger_col] + [col for col in df.columns if 'id' in col or df[col].nunique() > 50]
         numerical_features = [f for f in numerical_features if f not in features_to_exclude]
         categorical_features = [f for f in categorical_features if f not in features_to_exclude]
 
         for col in categorical_features:
             le = LabelEncoder()
-            df[col] = df[col].astype(str) # Ensure all are strings before fitting
+            df[col] = df[col].astype(str)
             df[col] = le.fit_transform(df[col])
             self.label_encoders[col] = le
         
         feature_cols = numerical_features + categorical_features
-        if not feature_cols:
-            st.warning("No suitable features found for model training.")
-            return
+        if not feature_cols: return
 
         X = df[feature_cols].fillna(0)
         y = df[passenger_col]
@@ -247,21 +276,20 @@ class AdvancedFetiiAI:
                 best_score = score
                 best_model_name = name
         
-        self.models['best_model'] = self.models[best_model_name]
-        st.session_state.best_model_name = best_model_name
-        
-        # Store feature importances from the best tree-based model
-        best_model_obj = self.models['best_model']['model']
-        if hasattr(best_model_obj, 'feature_importances_'):
-            self.feature_importances = pd.DataFrame({
-                'feature': feature_cols,
-                'importance': best_model_obj.feature_importances_
-            }).sort_values('importance', ascending=False)
-
+        if best_model_name:
+            self.models['best_model'] = self.models[best_model_name]
+            st.session_state.best_model_name = best_model_name
+            best_model_obj = self.models['best_model']['model']
+            if hasattr(best_model_obj, 'feature_importances_'):
+                self.feature_importances = pd.DataFrame({
+                    'feature': feature_cols,
+                    'importance': best_model_obj.feature_importances_
+                }).sort_values('importance', ascending=False)
+            
     def predict_passengers(self, features_dict):
         if 'best_model' not in self.models:
             return None, "Prediction model not available."
-        
+            
         try:
             model_info = self.models['best_model']
             model = model_info['model']
@@ -269,12 +297,18 @@ class AdvancedFetiiAI:
             
             input_df = pd.DataFrame([features_dict])
             
-            # Ensure input_df has all the required feature columns
             for col in feature_cols:
                 if col not in input_df.columns:
-                    input_df[col] = 0 # Default value for missing features
+                    input_df[col] = 0
             
-            input_df = input_df[feature_cols] # Order columns correctly
+            categorical_features = [col for col in feature_cols if col in self.label_encoders]
+            for col in categorical_features:
+                if col in self.label_encoders:
+                    input_df[col] = self.label_encoders[col].transform(input_df[col].astype(str))
+                else:
+                    input_df[col] = 0
+            
+            input_df = input_df[feature_cols]
             
             prediction = model.predict(input_df)[0]
             confidence = model_info['score']
@@ -283,51 +317,41 @@ class AdvancedFetiiAI:
         except Exception as e:
             return None, f"Prediction error: {e}"
 
-    def get_feature_importances(self):
-        return self.feature_importances
-
     def intelligent_query_processor(self, question):
         question_lower = question.lower().strip()
         
-        if any(word in question_lower for word in ['fetii', 'company', 'about']):
-            return """
-            **About Fetii Inc.** 🚗
-            Fetii is a shared mobility company revolutionizing group transportation. Our mission is to provide on-demand group rides that reduce traffic congestion and carbon emissions.
-            - **Founded**: 2019
-            - **Headquarters**: Austin, Texas
-            - **Core Service**: On-demand vans for group travel.
-            """
+        if 'total trips' in question_lower or 'how many rides' in question_lower:
+            return f"📊 **Total Trips**: The dataset contains **{self.metrics.get('total_trips', 'N/A'):,}** trips."
+        if 'busiest hour' in question_lower or 'peak time' in question_lower:
+            return f"⏰ **Peak Hour**: The busiest hour for trips is **{self.metrics.get('peak_hour', 'N/A')}:00**."
+        if 'average passengers' in question_lower or 'avg pax' in question_lower:
+            avg_pax = self.metrics.get('avg_passengers_per_trip', 'N/A')
+            return f"👥 **Average Passengers**: On average, there are **{avg_pax:.2f}** passengers per trip." if isinstance(avg_pax, (int, float)) else f"👥 **Average Passengers**: N/A"
         
-        if any(word in question_lower for word in ['how many trips', 'total rides']):
-            return f"📊 **Total Trips**: The dataset contains **{self.metrics['total_trips']:,}** trips."
-            
-        if any(word in question_lower for word in ['busiest hour', 'peak time']):
-            return f"⏰ **Peak Hour**: The busiest hour for trips is **{self.metrics['peak_hour']}:00**."
-
-        if any(word in question_lower for word in ['average passengers', 'avg pax']):
-            avg_pax = self.metrics['avg_passengers_per_trip']
-            return f"👥 **Average Passengers**: On average, there are **{avg_pax:.2f}** passengers per trip."
-        
-        # Fallback for more complex queries
-        return """
-        I can answer specific questions about the data. Try asking:
-        - "What are the total trips?"
-        - "What is the busiest hour?"
-        - "Show me passenger patterns on weekends."
-        
-        For more detailed analysis, please check the **Analytics Dashboard** and **Predictive Analytics** tabs.
-        """
-
+        if self.api_available:
+            try:
+                system_instruction = "You are a helpful and knowledgeable AI assistant for a ride-sharing company called Fetii. Your task is to answer user questions about the company and its trip data. Use a professional and friendly tone."
+                
+                response = self.gemini_model.generate_content(
+                    f"{system_instruction}\nUser Query: {question}",
+                    generation_config=genai.types.GenerationConfig(temperature=0.2)
+                )
+                
+                return f"🤖 **AI Model Response:** {response.text}"
+            except Exception as e:
+                return f"An error occurred with the Gemini API. Please try a simpler question. Error: {e}"
+        else:
+            return "The Gemini AI model is not available. Please ensure your API key is correctly set up."
+    
 def create_analytics_dashboard(ai_assistant):
     st.header("📊 Analytics Dashboard")
     
     if not ai_assistant.data_loaded or ai_assistant.enhanced_data is None:
-        st.warning("Please upload data to view analytics.")
+        st.warning("Data not loaded. Please ensure the 'FetiiAI_Data_Austin.xlsx' file is in the correct path.")
         return
     
     df = ai_assistant.enhanced_data
     
-    # Key Metrics Row
     st.markdown("### Key Metrics")
     m = ai_assistant.metrics
     cols = st.columns(4)
@@ -346,7 +370,6 @@ def create_analytics_dashboard(ai_assistant):
     col1, col2 = st.columns(2)
     
     with col1:
-        # Hourly Trip Patterns
         if 'hour' in df.columns:
             st.markdown("#### Hourly Trip Patterns")
             hourly_counts = df['hour'].value_counts().sort_index()
@@ -355,18 +378,19 @@ def create_analytics_dashboard(ai_assistant):
             fig.update_layout(plot_bgcolor='white')
             st.plotly_chart(fig, use_container_width=True)
 
-        # Feature Importance
         importances = ai_assistant.get_feature_importances()
-        if importances is not None:
+        if importances is not None and not importances.empty:
             st.markdown("#### Key Predictors for Passenger Count")
             fig = px.bar(importances.head(10), x='importance', y='feature', orientation='h',
                          labels={'importance': 'Importance Score', 'feature': 'Feature'},
                          color_discrete_sequence=['#FF5252'])
             fig.update_layout(yaxis={'categoryorder':'total ascending'}, plot_bgcolor='white')
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Feature importance data not available. Ensure a predictive model was successfully trained.")
+
 
     with col2:
-        # Day of Week Analysis
         if 'day_of_week' in df.columns:
             st.markdown("#### Trips by Day of Week")
             daily_counts = df['day_of_week'].value_counts().sort_index()
@@ -378,7 +402,6 @@ def create_analytics_dashboard(ai_assistant):
             fig.update_layout(plot_bgcolor='white')
             st.plotly_chart(fig, use_container_width=True)
     
-        # Correlation Heatmap
         st.markdown("#### Feature Correlation Heatmap")
         numerical_df = df.select_dtypes(include=np.number)
         corr = numerical_df.corr()
@@ -387,7 +410,6 @@ def create_analytics_dashboard(ai_assistant):
         plt.title('Correlation Matrix of Numerical Features')
         st.pyplot(fig_heatmap)
 
-    # Geospatial Heatmap
     lat_cols = [col for col in df.columns if 'lat' in col]
     lon_cols = [col for col in df.columns if 'lon' in col]
     if lat_cols and lon_cols:
@@ -396,16 +418,16 @@ def create_analytics_dashboard(ai_assistant):
         pickup_data = df[[lat_cols[0], lon_cols[0]]].dropna()
         if not pickup_data.empty:
             fig = px.density_mapbox(pickup_data, lat=lat_cols[0], lon=lon_cols[0], radius=10,
-                                   center=dict(lat=pickup_data[lat_cols[0]].mean(), lon=pickup_data[lon_cols[0]].mean()),
-                                   zoom=10, mapbox_style="carto-positron",
-                                   color_continuous_scale="Reds")
+                                    center=dict(lat=pickup_data[lat_cols[0]].mean(), lon=pickup_data[lon_cols[0]].mean()),
+                                    zoom=10, mapbox_style="carto-positron",
+                                    color_continuous_scale="Reds")
             st.plotly_chart(fig, use_container_width=True)
 
 def create_prediction_interface(ai_assistant):
     st.header("🔮 Predictive Analytics")
     
     if not ai_assistant.data_loaded or 'best_model' not in ai_assistant.models:
-        st.warning("Upload data and ensure a 'passenger' column exists to use predictive features.")
+        st.warning("Data not loaded or model not trained. Please ensure the 'FetiiAI_Data_Austin.xlsx' file is in the correct path and contains a 'passenger' column.")
         return
     
     st.markdown("### Forecast Passenger Demand")
@@ -464,27 +486,18 @@ def generate_business_insight(prediction, hour, day_of_week):
     return " ".join(insight)
 
 def main():
-    st.markdown('<div class="main-header"><h1>🚗 Fetii Advanced AI Assistant</h1><p>Upload your trip data to unlock insights, analytics, and predictions.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header"><h1>🚗 Fetii Advanced AI Assistant</h1><p>Data-driven insights and predictive analytics at your fingertips.</p></div>', unsafe_allow_html=True)
     
-    if 'ai_assistant' not in st.session_state:
-        st.session_state.ai_assistant = AdvancedFetiiAI()
+    ai_assistant, success = load_data_and_train_models(DATA_FILE_PATH)
     
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
     
     with st.sidebar:
         st.title("🎛️ Control Panel")
-        uploaded_file = st.file_uploader("Upload Trip Data (CSV or Excel)", type=['csv', 'xlsx'])
+        st.info("Data is pre-loaded from `FetiiAI_Data_Austin.xlsx`")
         
-        if uploaded_file and not st.session_state.ai_assistant.data_loaded:
-            with st.spinner("🚀 Processing data and training AI models..."):
-                if st.session_state.ai_assistant.load_data(uploaded_file):
-                    st.success("✅ AI system is ready!")
-                    st.rerun()
-                else:
-                    st.error("❌ Failed to initialize AI. Please check the file.")
-        
-        if st.session_state.ai_assistant.data_loaded:
+        if success:
             st.success("AI Ready")
             st.header("Quick Actions")
             quick_queries = ["What is the busiest hour?", "How many total trips are there?", "Tell me about Fetii"]
@@ -495,6 +508,8 @@ def main():
             if st.button("🗑️ Clear Chat", use_container_width=True):
                 st.session_state.chat_history = []
                 st.rerun()
+        else:
+            st.error("AI is not ready. Check file and API key setup.")
     
     tab1, tab2, tab3 = st.tabs(["💬 AI Chat Assistant", "📊 Analytics Dashboard", "🔮 Predictive Analytics"])
     
@@ -518,19 +533,21 @@ def main():
             
             with st.chat_message("assistant"):
                 with st.spinner("🧠 Thinking..."):
-                    if st.session_state.ai_assistant.data_loaded:
-                        response = st.session_state.ai_assistant.intelligent_query_processor(user_query)
+                    if success:
+                        response = ai_assistant.intelligent_query_processor(user_query)
                     else:
-                        response = "Please upload your trip data first. In the meantime, I can answer general questions about Fetii."
+                        response = "I'm not ready yet. Please ensure the data file and API key are correctly configured."
                     st.markdown(response, unsafe_allow_html=True)
                     st.session_state.chat_history.append({"role": "assistant", "content": response})
             st.rerun()
 
     with tab2:
-        create_analytics_dashboard(st.session_state.ai_assistant)
+        create_analytics_dashboard(ai_assistant)
     
     with tab3:
-        create_prediction_interface(st.session_state.ai_assistant)
+        create_prediction_interface(ai_assistant)
 
 if __name__ == "__main__":
     main()
+
+
