@@ -8,3 +8,4 @@ scikit-learn
 geopy
 joblib
 openpyxl
+google-generativeai
