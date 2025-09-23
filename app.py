@@ -20,7 +20,7 @@ warnings.filterwarnings('ignore')
 
 # --- Global Configuration ---
 DATA_FILE_PATH = "FetiiAI_Data_Austin.xlsx"
-GEMINI_MODEL_NAME = "gemini-1.5-flash" # Use the correct model name here
+GEMINI_MODEL_NAME = "gemini-1.5-flash"
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -137,9 +137,13 @@ class AdvancedFetiiAI:
         
         # Configure Gemini API
         try:
-            genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-            self.gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-            self.api_available = True
+            # Check if API key is in secrets
+            if "GOOGLE_API_KEY" in st.secrets:
+                genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+                self.gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+                self.api_available = True
+            else:
+                st.warning("Google API Key not found in `.streamlit/secrets.toml`. Chat functionality will be limited.")
         except Exception as e:
             st.error(f"Gemini API could not be configured with model '{GEMINI_MODEL_NAME}'. Please check your `.streamlit/secrets.toml` file and the model name. Error: {e}")
             self.api_available = False
@@ -278,7 +282,7 @@ class AdvancedFetiiAI:
         
         if best_model_name:
             self.models['best_model'] = self.models[best_model_name]
-            st.session_state.best_model_name = best_model_name
+            st.session_state.best_model_name = best_model_name # Initialize session state variable here
             best_model_obj = self.models['best_model']['model']
             if hasattr(best_model_obj, 'feature_importances_'):
                 self.feature_importances = pd.DataFrame({
@@ -295,8 +299,10 @@ class AdvancedFetiiAI:
             model = model_info['model']
             feature_cols = model_info['features']
             
+            # Ensure features_dict contains all expected features
             input_df = pd.DataFrame([features_dict])
             
+            # Add any missing features with a default value (e.g., 0)
             for col in feature_cols:
                 if col not in input_df.columns:
                     input_df[col] = 0
@@ -488,10 +494,15 @@ def generate_business_insight(prediction, hour, day_of_week):
 def main():
     st.markdown('<div class="main-header"><h1>🚗 Fetii Advanced AI Assistant</h1><p>Data-driven insights and predictive analytics at your fingertips.</p></div>', unsafe_allow_html=True)
     
-    ai_assistant, success = load_data_and_train_models(DATA_FILE_PATH)
-    
+    # Initialize session state variables before calling load_data_and_train_models
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
+    if 'best_model_name' not in st.session_state:
+        st.session_state.best_model_name = None
+    if 'user_query' not in st.session_state:
+        st.session_state.user_query = None
+
+    ai_assistant, success = load_data_and_train_models(DATA_FILE_PATH)
     
     with st.sidebar:
         st.title("🎛️ Control Panel")
@@ -523,7 +534,7 @@ def main():
         
         user_query = st.chat_input("Ask a question...")
         
-        if 'user_query' in st.session_state:
+        if st.session_state.user_query:
             user_query = st.session_state.pop('user_query')
         
         if user_query:
@@ -549,5 +560,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
